@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
-# full_ups_zabbix_install_native_interactive.sh
-# Native NUT (no Docker) + Zabbix scripts, with multi-UPS prompts and hang-hardening.
+# nut_setup_native.sh
+# Native NUT + Zabbix externalscripts with multi-UPS prompts and safe timeouts.
 set -euo pipefail
 
 require_root() {
@@ -11,7 +11,7 @@ require_root() {
 }
 require_root
 
-# ---------- Defaults (override via env if desired) ----------
+# ---------- Defaults (override via env) ----------
 UPS_NAME_DEFAULT="${UPS_NAME_DEFAULT:-tt-ups-rack-1}"
 UPS_IP_DEFAULT="${UPS_IP_DEFAULT:-10.193.11.66}"
 COMMUNITY_DEFAULT="${COMMUNITY_DEFAULT:-corp-it}"
@@ -23,24 +23,54 @@ SNMP_TIMEOUT="${SNMP_TIMEOUT:-3}"
 SNMP_RETRIES="${SNMP_RETRIES:-1}"
 POLLINTERVAL="${POLLINTERVAL:-10}"
 MAXAGE="${MAXAGE:-30}"
-DEADTIME="${DEADTIME:-15}"
+DEADTIME="${DEADTIME:-30}"
 MINSUPPLIES="${MINSUPPLIES:-1}"
 
 CFG_DIR="/etc/nut"
+RUN_DIR="/run/nut"
 SCRIPTS_DIR="/usr/lib/zabbix/externalscripts"
 
-echo "=== APT Maintenance and Setup ==="
-export DEBIAN_FRONTEND=noninteractive
-apt clean all || true
-apt update -y
-apt -y install nut-server nut-client nut-snmp snmp curl jq || {
-  echo "Failed to install required packages." >&2; exit 1; }
-systemctl restart zabbix-proxy || true
-echo "=== Base setup complete ==="
+echo "=== Stop services & clean old configs ==="
+systemctl stop nut-server nut-client 2>/dev/null || true
+/sbin/upsdrvctl stop all 2>/dev/null || true
 
-# ---------- Interactive: collect >=1 UPS, allow many ----------
+if [[ -d "$CFG_DIR" ]]; then
+  TS="$(date +%Y%m%d-%H%M%S)"
+  echo "Backing up $CFG_DIR -> ${CFG_DIR}.bak-${TS}"
+  mv "$CFG_DIR" "${CFG_DIR}.bak-${TS}"
+fi
+mkdir -p "$CFG_DIR"
+
+# Clean runtime (ignore scheduler subdir)
+install -d -o root -g root -m 0755 "$RUN_DIR"
+find "$RUN_DIR" -mindepth 1 -maxdepth 1 ! -name 'upssched' -exec rm -rf {} + 2>/dev/null || true
+
+echo "=== Ensure users/groups ==="
+getent group nut >/dev/null || groupadd --system nut
+getent passwd nut >/dev/null || useradd --system -g nut -d /var/lib/nut -s /usr/sbin/nologin nut
+# Make sure zabbix exists; if not, skip this (Zabbix might be on a different box)
+if getent passwd zabbix >/dev/null; then
+  usermod -aG nut zabbix || true
+fi
+install -d -o nut -g nut -m 0775 "$RUN_DIR"
+
+echo "=== Install packages ==="
+export DEBIAN_FRONTEND=noninteractive
+apt-get update -y
+apt-get install -y nut-server nut-client nut-snmp snmp curl jq
+
+# Optional: AppArmor relax (only if available + enforced). Set AA_COMPLAIN=1 to force.
+if command -v aa-status >/dev/null 2>&1; then
+  if aa-status 2>/dev/null | grep -q "profiles are in enforce mode"; then
+    if [[ "${AA_COMPLAIN:-1}" = "1" ]]; then
+      echo "Putting snmp-ups AppArmor profile into complain mode (temporary safety)."
+      aa-complain /usr/lib/nut/snmp-ups 2>/dev/null || true
+    fi
+  fi
+fi
+
 echo
-echo "=== NUT UPS configuration ==="
+echo "=== NUT UPS configuration (interactive) ==="
 read -r -p "SNMP community [${COMMUNITY_DEFAULT}]: " COMMUNITY
 COMMUNITY="${COMMUNITY:-$COMMUNITY_DEFAULT}"
 
@@ -63,7 +93,7 @@ add_one() {
   UPS_IPS+=("$i")
 }
 
-# always add at least one
+# Always add at least one
 add_one
 while true; do
   read -r -p "Add another UPS? [y/N]: " yn
@@ -83,15 +113,14 @@ for idx in "${!UPS_NAMES[@]}"; do
 done
 echo
 
-# ---------- Write NUT configs ----------
-mkdir -p "$CFG_DIR"
-
+echo "=== Write NUT configs ==="
 # ups.conf
 {
   for idx in "${!UPS_NAMES[@]}"; do
     u="${UPS_NAMES[$idx]}"; ip="${UPS_IPS[$idx]}"
     cat <<EOF
 [${u}]
+  user = nut
   driver = snmp-ups
   port = ${ip}
   community = ${COMMUNITY}
@@ -133,26 +162,47 @@ EOF
 RUN_AS_USER nut
 MINSUPPLIES ${MINSUPPLIES}
 DEADTIME ${DEADTIME}
-# Optional: reduce log noise
 POWERDOWNFLAG /etc/killpower
 EOF
 } > "$CFG_DIR/upsmon.conf"
 
 echo "MODE=netserver" > "$CFG_DIR/nut.conf"
 
-# ---------- Enable + Start Services ----------
-# Stop any existing drivers (safe) then start all with upsdrvctl
-/sbin/upsdrvctl stop all >/dev/null 2>&1 || true
-/sbin/upsdrvctl -u root start || true
+echo "=== systemd override: run drivers with -u nut ==="
+mkdir -p /etc/systemd/system/nut-driver@.service.d
+cat > /etc/systemd/system/nut-driver@.service.d/override.conf <<'EOF'
+[Service]
+ExecStart=
+ExecStart=/sbin/upsdrvctl -u nut start %i
+ExecStop=
+ExecStop=/sbin/upsdrvctl -u nut stop %i
+EOF
+
+systemctl daemon-reload
+
+echo "=== Start drivers and services ==="
+# Clean stale runtime sockets
+find "$RUN_DIR" -mindepth 1 -maxdepth 1 ! -name 'upssched' -exec rm -rf {} + 2>/dev/null || true
+
+# Start each driver explicitly (ensures matching unit names available)
+for u in "${UPS_NAMES[@]}"; do
+  # Try via template unit if present, else fallback to upsdrvctl
+  if systemctl list-unit-files | grep -q '^nut-driver@'; then
+    systemctl stop "nut-driver@${u}.service" 2>/dev/null || true
+    systemctl start "nut-driver@${u}.service"
+  else
+    /sbin/upsdrvctl -u nut stop "${u}" 2>/dev/null || true
+    /sbin/upsdrvctl -u nut start "${u}"
+  fi
+done
 
 systemctl enable nut-server nut-client >/dev/null 2>&1 || true
 systemctl restart nut-server nut-client
 
-echo "=== NUT services status (brief) ==="
-systemctl --no-pager --plain --full status nut-server | sed -n '1,10p' || true
-systemctl --no-pager --plain --full status nut-client | sed -n '1,10p' || true
+echo "=== Permissions sanity ==="
+ls -l "$RUN_DIR" || true
 
-# ---------- Zabbix External Scripts (with timeouts) ----------
+echo "=== Zabbix External Scripts (with timeouts) ==="
 mkdir -p "$SCRIPTS_DIR"
 umask 022
 
@@ -164,16 +214,15 @@ write() {
   echo "Created $path"
 }
 
-# Generic helper: safe_upsc with timeout to prevent hangs
+# Shared helper
 write "$SCRIPTS_DIR/_ups_common.sh" '#!/bin/bash
 set -euo pipefail
 UPS_QUERY_TIMEOUT=${UPS_QUERY_TIMEOUT:-5}
 safe_upsc() { timeout -k 1 "${UPS_QUERY_TIMEOUT}" upsc "$1" 2>/dev/null; }
 '
 
-# 1) ups_discovery_filtered.sh
+# Discovery (filtered)
 write "$SCRIPTS_DIR/ups_discovery_filtered.sh" '#!/bin/bash
-# Usage: ups_discovery_filtered.sh UPS_NAME [UPS_HOST]
 set -euo pipefail
 . '"$SCRIPTS_DIR"'/_ups_common.sh
 UPS_NAME="${1:?Usage: $0 UPS_NAME [UPS_HOST]}"; UPS_HOST="${2:-localhost}"
@@ -184,9 +233,8 @@ safe_upsc "$UPS_NAME@$UPS_HOST" | awk -F: '"'"'
   }'"'"' | sed '"'"'s/,$//'"'"' | awk '"'"'{print "{\"data\":["$0"]}"}'"'"''
 '
 
-# 2) ups_discovery.sh
+# Discovery (all)
 write "$SCRIPTS_DIR/ups_discovery.sh" '#!/bin/bash
-# Usage: ups_discovery.sh UPS_NAME [UPS_HOST]
 set -euo pipefail
 . '"$SCRIPTS_DIR"'/_ups_common.sh
 UPS_NAME="${1:?Usage: $0 UPS_NAME [UPS_HOST]}"; UPS_HOST="${2:-localhost}"
@@ -194,43 +242,34 @@ safe_upsc "$UPS_NAME@$UPS_HOST" | awk -F: '"'"'{k=$1; gsub(/^[ \t]+|[ \t]+$/, ""
 | sed '"'"'s/,$//'"'"' | awk '"'"'{print "{\"data\":["$0"]}"}'"'"''
 '
 
-# 3) ups_host_discovery.sh
+# Host-level UPS LLD (from ups.conf)
 write "$SCRIPTS_DIR/ups_host_discovery.sh" '#!/bin/bash
-# Usage: ups_host_discovery.sh [/etc/nut/ups.conf]
 set -euo pipefail
 CONF="${1:-/etc/nut/ups.conf}"
 awk -F"[][]" '"'"'/^\[.*\]/{printf "{\"{#UPSNAME}\":\"%s\"},", $2}'"'"' "$CONF" | \
 sed '"'"'s/,$//'"'"' | awk '"'"'{print "{\"data\":["$0"]}"}'"'"''
 '
 
-# 4) ups_simple_dynamic.sh
+# Simple key fetchers
 write "$SCRIPTS_DIR/ups_simple_dynamic.sh" '#!/bin/bash
-# Usage: ups_simple_dynamic.sh UPS_NAME KEY [UPS_HOST]
 set -euo pipefail
 . '"$SCRIPTS_DIR"'/_ups_common.sh
 UPS_NAME="${1:?Usage: $0 UPS_NAME KEY [UPS_HOST]}"; KEY="${2:?}"; UPS_HOST="${3:-localhost}"
 safe_upsc "$UPS_NAME@$UPS_HOST" | awk -F: -v key="$KEY" '"'"'$1==key{v=$2; gsub(/^[ \t]+|[ \t]+$/,"",v); print v}'"'"''
 '
 
-# 5) ups_value.sh
 write "$SCRIPTS_DIR/ups_value.sh" '#!/bin/bash
-# Usage: ups_value.sh UPS_NAME KEY [UPS_HOST]
 set -euo pipefail
 . '"$SCRIPTS_DIR"'/_ups_common.sh
 UPS_NAME="${1:?Usage: $0 UPS_NAME KEY [UPS_HOST]}"; KEY="${2:?}"; UPS_HOST="${3:-localhost}"
 safe_upsc "$UPS_NAME@$UPS_HOST" | awk -F: -v key="$KEY" '"'"'$1==key{v=$2; gsub(/^[ \t]+|[ \t]+$/,"",v); print v}'"'"''
 '
 
-# ---------- Quick checks ----------
 echo
-echo "=== Setup Complete ==="
-echo "Configs in:   ${CFG_DIR}"
-echo "Zabbix scripts: ${SCRIPTS_DIR}"
+echo "=== Smoke tests ==="
+echo "  upsc ${UPS_NAMES[0]}@localhost ups.status || true"
+upsc "${UPS_NAMES[0]}@localhost" ups.status || true
 echo
-echo "Quick checks:"
-echo "  snmpwalk -v2c -c ${COMMUNITY} ${UPS_IPS[0]} 1.3.6.1.2.1.1.5.0"
-echo "  upsc ${UPS_NAMES[0]}@localhost | head -n 20"
-echo "  ${SCRIPTS_DIR}/ups_host_discovery.sh"
-echo "  ${SCRIPTS_DIR}/ups_discovery.sh ${UPS_NAMES[0]} localhost"
-echo
-echo "Tip: set Zabbix macros or item params to pass UPS name per item; all helper scripts time out safely."
+echo "=== Done. ==="
+echo "If you see 'Driver not connected' for a few seconds, that's normal while drivers attach."
+echo "Zabbix tip: use nodata(3m)=1 for comms alerts; items at 30–60s intervals."
